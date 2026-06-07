@@ -1,0 +1,9 @@
+[project]
+name = "coral"
+description = "Multi-agent orchestrator — decomposes tasks and spawns parallel agent swarms via Coral Protocol"
+version = "0.1.0"
+
+[tool.centaur]
+type = "persona"
+engine = "claude-code"
+prompt = "PROMPT.md"

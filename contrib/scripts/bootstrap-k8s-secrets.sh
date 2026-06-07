@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NAMESPACE="centaur"
+FORCE=0
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/bootstrap-k8s-secrets.sh [--namespace NAMESPACE] [--force]
+
+Creates the required local-dev Kubernetes infra Secrets consumed by the Helm chart.
+Requires OP_SERVICE_ACCOUNT_TOKEN, OP_VAULT, SLACK_BOT_TOKEN,
+SLACK_SIGNING_SECRET, and SLACKBOT_API_KEY in the shell environment.
+
+Optional 1Password Connect bootstrap (when ironProxy.manager.secretSource is
+set to onepassword-connect in the Helm values):
+  OP_CONNECT_CREDENTIALS_FILE  path to 1password-credentials.json; if set,
+                               creates Secret centaur-onepassword-connect-credentials
+  OP_CONNECT_TOKEN             Connect API token; added to centaur-infra-env
+
+Optional local-dev admin key:
+  LOCAL_DEV_API_KEY            seeded as the admin bearer for the API service
+                               (envFrom centaur-infra-env). Re-run with --force
+                               or kubectl patch to rotate.
+
+Optional iron-control bootstrap (consumed when ironControl.enabled=true):
+  IRON_CONTROL_DATABASE_URL    overrides the derived DSN (default points at the
+                               bundled Postgres server with no database path, so
+                               Rails resolves db names from its database.yml)
+  IRON_CONTROL_INITIAL_USER_EMAIL
+                               initial admin email (default admin@centaur.local)
+  The initial password, API key, the three ActiveRecord encryption keys, and
+  SECRET_KEY_BASE are auto-generated when absent (never rotated in place).
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --namespace|-n)
+      NAMESPACE="${2:?--namespace requires a value}"
+      shift 2
+      ;;
+    --force)
+      FORCE=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+require_env() {
+  local name="$1"
+  if [[ -z "${!name:-}" ]]; then
+    echo "FATAL: $name is required in the shell environment" >&2
+    exit 1
+  fi
+}
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "FATAL: required command not found: $1" >&2
+    exit 1
+  fi
+}
+
+secret_exists() {
+  kubectl -n "$NAMESPACE" get secret "$1" >/dev/null 2>&1
+}
+
+delete_if_forced() {
+  local name="$1"
+  if [[ "$FORCE" == "1" ]]; then
+    kubectl -n "$NAMESPACE" delete secret "$name" --ignore-not-found >/dev/null
+  fi
+}
+
+rand_hex() {
+  openssl rand -hex 32 | tr -d '\n'
+}
+
+require_cmd kubectl
+require_cmd openssl
+require_env OP_SERVICE_ACCOUNT_TOKEN
+require_env OP_VAULT
+require_env SLACK_BOT_TOKEN
+require_env SLACK_SIGNING_SECRET
+require_env SLACKBOT_API_KEY
+
+kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+delete_if_forced centaur-infra-env
+delete_if_forced centaur-firewall-ca
+delete_if_forced centaur-firewall-ca-key
+delete_if_forced centaur-onepassword-connect-credentials
+
+secret_key_present() {
+  local key="$1"
+  local value
+  value="$(kubectl -n "$NAMESPACE" get secret centaur-infra-env \
+    -o "jsonpath={.data.${key}}" 2>/dev/null || true)"
+  [[ -n "$value" ]]
+}
+
+if secret_exists centaur-infra-env; then
+  patch_data=()
+  if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
+    patch_data+=("\"OP_CONNECT_TOKEN\":\"$(printf '%s' "$OP_CONNECT_TOKEN" | base64 | tr -d '\n')\"")
+  fi
+  # Top-up IRON_BROKER_TOKEN for clusters bootstrapped before iron-token-broker
+  # support landed. Only generated when absent so we don't rotate it out from
+  # under cached iron-proxy access tokens on every script run.
+  if ! secret_key_present IRON_BROKER_TOKEN; then
+    patch_data+=("\"IRON_BROKER_TOKEN\":\"$(rand_hex | base64 | tr -d '\n')\"")
+  fi
+  if [[ -n "${LOCAL_DEV_API_KEY:-}" ]]; then
+    patch_data+=("\"LOCAL_DEV_API_KEY\":\"$(printf '%s' "$LOCAL_DEV_API_KEY" | base64 | tr -d '\n')\"")
+  fi
+  # iron-control keys: top up only when absent so we never rotate them out from
+  # under a running pod (its ActiveRecord-encrypted data would become
+  # undecryptable). Generated values mirror the create path.
+  if ! secret_key_present IRON_CONTROL_DATABASE_URL; then
+    if [[ -n "${IRON_CONTROL_DATABASE_URL:-}" ]]; then
+      ic_db_url="$IRON_CONTROL_DATABASE_URL"
+    else
+      # Reuse the same Postgres host/credentials as the API's DATABASE_URL but
+      # strip the database path, so Rails resolves the database name from the
+      # image's database.yml. Avoids decoding the password ourselves.
+      existing_db_url="$(kubectl -n "$NAMESPACE" get secret centaur-infra-env \
+        -o 'jsonpath={.data.DATABASE_URL}' | openssl base64 -d -A)"
+      ic_db_url="${existing_db_url%/ai_v2}"
+    fi
+    patch_data+=("\"IRON_CONTROL_DATABASE_URL\":\"$(printf '%s' "$ic_db_url" | base64 | tr -d '\n')\"")
+  fi
+  if ! secret_key_present IRON_CONTROL_INITIAL_USER_EMAIL; then
+    ic_email="${IRON_CONTROL_INITIAL_USER_EMAIL:-admin@centaur.local}"
+    patch_data+=("\"IRON_CONTROL_INITIAL_USER_EMAIL\":\"$(printf '%s' "$ic_email" | base64 | tr -d '\n')\"")
+  fi
+  if ! secret_key_present IRON_CONTROL_INITIAL_USER_PASSWORD; then
+    patch_data+=("\"IRON_CONTROL_INITIAL_USER_PASSWORD\":\"$(rand_hex | base64 | tr -d '\n')\"")
+  fi
+  if ! secret_key_present IRON_CONTROL_INITIAL_API_KEY; then
+    patch_data+=("\"IRON_CONTROL_INITIAL_API_KEY\":\"$(printf 'iak_%s' "$(rand_hex)" | base64 | tr -d '\n')\"")
+  fi
+  if ! secret_key_present IRON_CONTROL_AR_ENCRYPTION_PRIMARY_KEY; then
+    patch_data+=("\"IRON_CONTROL_AR_ENCRYPTION_PRIMARY_KEY\":\"$(rand_hex | base64 | tr -d '\n')\"")
+  fi
+  if ! secret_key_present IRON_CONTROL_AR_ENCRYPTION_DETERMINISTIC_KEY; then
+    patch_data+=("\"IRON_CONTROL_AR_ENCRYPTION_DETERMINISTIC_KEY\":\"$(rand_hex | base64 | tr -d '\n')\"")
+  fi
+  if ! secret_key_present IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT; then
+    patch_data+=("\"IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT\":\"$(rand_hex | base64 | tr -d '\n')\"")
+  fi
+  if ! secret_key_present IRON_CONTROL_SECRET_KEY_BASE; then
+    patch_data+=("\"IRON_CONTROL_SECRET_KEY_BASE\":\"$(printf '%s%s' "$(rand_hex)" "$(rand_hex)" | base64 | tr -d '\n')\"")
+  fi
+  if [[ "${#patch_data[@]}" -gt 0 ]]; then
+    patch_json="{\"data\":{$(IFS=,; echo "${patch_data[*]}")}}"
+    kubectl -n "$NAMESPACE" patch secret centaur-infra-env --type merge -p "$patch_json" >/dev/null
+    echo "Updated optional keys in Secret centaur-infra-env in namespace $NAMESPACE"
+  fi
+  echo "Secret centaur-infra-env already exists in namespace $NAMESPACE; leaving unchanged"
+else
+  POSTGRES_PASSWORD="$(rand_hex)"
+  DATABASE_URL="postgresql://tempo:${POSTGRES_PASSWORD}@centaur-centaur-postgres:5432/ai_v2"
+  # iron-control runs against a dedicated logical DB on the same Postgres. The
+  # URL carries connection info only (no database path) so Rails resolves each
+  # connection's database name from the image's database.yml. Override via the
+  # IRON_CONTROL_DATABASE_URL env var to point at an external server.
+  IRON_CONTROL_DATABASE_URL="${IRON_CONTROL_DATABASE_URL:-postgresql://tempo:${POSTGRES_PASSWORD}@centaur-centaur-postgres:5432}"
+  IRON_CONTROL_INITIAL_USER_EMAIL="${IRON_CONTROL_INITIAL_USER_EMAIL:-admin@centaur.local}"
+  secret_args=(
+    -n "$NAMESPACE" create secret generic centaur-infra-env
+    --from-literal=IRON_MANAGEMENT_API_KEY="$(rand_hex)"
+    --from-literal=IRON_BROKER_TOKEN="$(rand_hex)"
+    --from-literal=SANDBOX_SIGNING_KEY="$(rand_hex)"
+    --from-literal=OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN"
+    --from-literal=OP_VAULT="$OP_VAULT"
+    --from-literal=SLACK_BOT_TOKEN="$SLACK_BOT_TOKEN"
+    --from-literal=SLACK_SIGNING_SECRET="$SLACK_SIGNING_SECRET"
+    --from-literal=SLACKBOT_API_KEY="$SLACKBOT_API_KEY"
+    --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD"
+    --from-literal=DATABASE_URL="$DATABASE_URL"
+    --from-literal=IRON_CONTROL_DATABASE_URL="$IRON_CONTROL_DATABASE_URL"
+    --from-literal=IRON_CONTROL_INITIAL_USER_EMAIL="$IRON_CONTROL_INITIAL_USER_EMAIL"
+    --from-literal=IRON_CONTROL_INITIAL_USER_PASSWORD="$(rand_hex)"
+    --from-literal=IRON_CONTROL_INITIAL_API_KEY="iak_$(rand_hex)"
+    --from-literal=IRON_CONTROL_AR_ENCRYPTION_PRIMARY_KEY="$(rand_hex)"
+    --from-literal=IRON_CONTROL_AR_ENCRYPTION_DETERMINISTIC_KEY="$(rand_hex)"
+    --from-literal=IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT="$(rand_hex)"
+    --from-literal=IRON_CONTROL_SECRET_KEY_BASE="$(rand_hex)$(rand_hex)"
+  )
+  if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
+    secret_args+=(--from-literal=OP_CONNECT_TOKEN="$OP_CONNECT_TOKEN")
+  fi
+  if [[ -n "${LOCAL_DEV_API_KEY:-}" ]]; then
+    secret_args+=(--from-literal=LOCAL_DEV_API_KEY="$LOCAL_DEV_API_KEY")
+  fi
+  kubectl "${secret_args[@]}" >/dev/null
+  echo "Created Secret centaur-infra-env in namespace $NAMESPACE"
+fi
+
+if secret_exists centaur-firewall-ca && secret_exists centaur-firewall-ca-key; then
+  echo "Firewall CA Secrets already exist in namespace $NAMESPACE; leaving unchanged"
+else
+  TMPDIR="$(mktemp -d)"
+  trap 'rm -rf "$TMPDIR"' EXIT
+  CA_KEY="$TMPDIR/ca-key.pem"
+  CA_CERT="$TMPDIR/ca-cert.pem"
+
+  openssl genrsa -out "$CA_KEY" 4096 >/dev/null 2>&1
+  openssl req -x509 -new -nodes \
+    -key "$CA_KEY" -sha256 -days 3650 \
+    -subj "/CN=centaur iron-proxy CA" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign" \
+    -out "$CA_CERT" >/dev/null 2>&1
+
+  kubectl -n "$NAMESPACE" create secret generic centaur-firewall-ca \
+    --from-file=ca-cert.pem="$CA_CERT" >/dev/null
+  kubectl -n "$NAMESPACE" create secret generic centaur-firewall-ca-key \
+    --from-file=ca-cert.pem="$CA_CERT" \
+    --from-file=ca-key.pem="$CA_KEY" >/dev/null
+  echo "Created firewall CA Secrets in namespace $NAMESPACE"
+fi
+
+if [[ -n "${OP_CONNECT_CREDENTIALS_FILE:-}" ]]; then
+  if [[ ! -r "$OP_CONNECT_CREDENTIALS_FILE" ]]; then
+    echo "FATAL: OP_CONNECT_CREDENTIALS_FILE=$OP_CONNECT_CREDENTIALS_FILE is not readable" >&2
+    exit 1
+  fi
+  if secret_exists centaur-onepassword-connect-credentials; then
+    echo "Secret centaur-onepassword-connect-credentials already exists in namespace $NAMESPACE; leaving unchanged"
+  else
+    kubectl -n "$NAMESPACE" create secret generic centaur-onepassword-connect-credentials \
+      --from-file=1password-credentials.json="$OP_CONNECT_CREDENTIALS_FILE" >/dev/null
+    echo "Created Secret centaur-onepassword-connect-credentials in namespace $NAMESPACE"
+  fi
+fi

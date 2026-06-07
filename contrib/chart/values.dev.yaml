@@ -1,0 +1,47 @@
+secretManager:
+  backend: onepassword
+  envPrefix: ""
+  existingSecretName: centaur-infra-env
+
+firewall:
+  existingCaSecretName: centaur-firewall-ca
+  existingCaKeySecretName: centaur-firewall-ca-key
+
+postgres:
+  auth:
+    existingSecretName: centaur-infra-env
+    existingSecretKey: POSTGRES_PASSWORD
+
+slackbot:
+  enabled: true
+  image:
+    pullPolicy: IfNotPresent
+
+api:
+  image:
+    pullPolicy: IfNotPresent
+  executionWorkerEnabled: true
+  pluginWatcherEnabled: true
+  egressDiscovery:
+    enabled: false
+
+ironProxy:
+  image:
+    pullPolicy: IfNotPresent
+  manager:
+    secretSource: onepassword
+
+tokenBroker:
+  enabled: true
+
+sandbox:
+  image:
+    pullPolicy: IfNotPresent
+  extraEnv:
+    CLAUDE_CODE_AUTH_MODE: access_token
+    CORAL_ENABLED: "1"
+
+# Run the tool-server sidecar by default in dev so local clusters mirror
+# production sandbox topology.
+toolServer:
+  enabled: true
